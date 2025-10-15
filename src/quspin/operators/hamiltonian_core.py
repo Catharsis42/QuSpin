@@ -184,6 +184,63 @@ def _hamiltonian_dot(hamiltonian, time, v):
     return hamiltonian.dot(v, time=time, check=False)
 
 
+def _SO(time, V, V_out, H):
+    # real time Schrodinger equation
+    V = V.reshape(V_out.shape)
+    H._static_matvec(H._static, V, out=V_out, overwrite_out=True)
+    for func, Hd in iteritems(H._dynamic):
+        H._dynamic_matvec[func](Hd, V, a=func(time), out=V_out, overwrite_out=False)
+
+    V_out *= -1j
+    return V_out.ravel()
+
+
+def _SO_real(time, V, V_out, H):
+    # real time Schrodinger equation for real hamiltonian
+    V = V.reshape(V_out.shape)
+    H._static_matvec(
+        H._static, V[H._Ns :], out=V_out[: H._Ns], a=+1, overwrite_out=True
+    )
+    H._static_matvec(
+        H._static, V[: H._Ns], out=V_out[H._Ns :], a=-1, overwrite_out=True
+    )
+    for func, Hd in iteritems(H._dynamic):
+        ft = func(time)
+        H._dynamic_matvec[func](
+            Hd, V[H._Ns :], out=V_out[: H._Ns], a=+ft, overwrite_out=False
+        )
+        H._dynamic_matvec[func](
+            Hd, V[: H._Ns], out=V_out[H._Ns :], a=-ft, overwrite_out=False
+        )
+
+    return V_out
+
+
+def _ISO(time, V, V_out, H):
+    # imaginary time Schrodinger equation
+    V = V.reshape(V_out.shape)
+    H._static_matvec(H._static, V, out=V_out, overwrite_out=True)
+    for func, Hd in iteritems(H._dynamic):
+        H._dynamic_matvec[func](Hd, V, a=func(time), out=V_out, overwrite_out=False)
+
+    V_out *= -1.0
+    return V_out.ravel()
+
+
+def _LO(time, rho, rho_out, H):
+    # Liouville-von Neumann equation
+    rho = rho.reshape((H.Ns, H.Ns))
+    H._static_matvec(H._static, rho, out=rho_out, a=+1.0, overwrite_out=True)
+    H._static_matvec(H._static.T, rho.T, out=rho_out.T, a=-1.0, overwrite_out=False)
+    for func, Hd in iteritems(H._dynamic):
+        ft = func(time)
+        H._dynamic_matvec[func](Hd, rho, out=rho_out, a=+ft, overwrite_out=False)
+        H._dynamic_matvec[func](Hd.T, rho.T, out=rho_out.T, a=-ft, overwrite_out=False)
+
+    rho_out *= -1j
+    return rho_out.ravel()
+
+
 class hamiltonian(object):
     """Constructs time-dependent (hermitian and nonhermitian) operators.
 
@@ -1387,109 +1444,19 @@ class hamiltonian(object):
 
     ### Schroedinger evolution routines
 
-    def __LO(self, time, rho, rho_out):
-        """
-        args:
-                rho, flattened density matrix to multiple with
-                time, the time to evalute drive at.
+    def __getstate__(self):
+        # Define a custom getstate method to handle unpickleable attributes
+        state = self.__dict__.copy()
+        # Remove the unpickleable entries.
+        del state['_static_matvec']
+        del state['_dynamic_matvec']
+        return state
 
-        description:
-                This function is what gets passed into the ode solver. This is the real time Liouville operator.
-
-        """
-        rho = rho.reshape((self.Ns, self.Ns))
-        self._static_matvec(
-            self._static, rho, out=rho_out, a=+1.0, overwrite_out=True
-        )  # rho_out = self._static.dot(rho)
-        self._static_matvec(
-            self._static.T, rho.T, out=rho_out.T, a=-1.0, overwrite_out=False
-        )  # rho_out -= (self._static.T.dot(rho.T)).T
-        for func, Hd in iteritems(self._dynamic):
-            ft = func(time)
-            self._dynamic_matvec[func](
-                Hd, rho, out=rho_out, a=+ft, overwrite_out=False
-            )  # rho_out += ft*Hd.dot(rho)
-            self._dynamic_matvec[func](
-                Hd.T, rho.T, out=rho_out.T, a=-ft, overwrite_out=False
-            )  # rho_out -= ft*(Hd.T.dot(rho.T)).T
-
-        rho_out *= -1j
-        return rho_out.ravel()
-
-    def __ISO(self, time, V, V_out):
-        """
-        args:
-                V, the vector to multiple with
-                V_out, the vector to use with output.
-                time, the time to evalute drive at.
-
-        description:
-                This function is what gets passed into the ode solver. This is the Imaginary time Schrodinger operator -H(t)*|V >
-        """
-        V = V.reshape(V_out.shape)
-        self._static_matvec(self._static, V, out=V_out, overwrite_out=True)
-        for func, Hd in iteritems(self._dynamic):
-            self._dynamic_matvec[func](
-                Hd, V, a=func(time), out=V_out, overwrite_out=False
-            )
-
-        V_out *= -1.0
-        return V_out.ravel()
-
-    def __SO_real(self, time, V, V_out):
-        """
-        args:
-                V, the vector to multiple with
-                V_out, the vector to use with output.
-                time, the time to evalute drive at.
-
-        description:
-                This function is what gets passed into the ode solver. This is the real time Schrodinger operator -i*H(t)*|V >
-                This function is designed for real hamiltonians and increases the speed of integration compared to __SO
-
-        u_dot + i*v_dot = -i*H(u + i*v)
-        u_dot = Hv
-        v_dot = -Hu
-        """
-        V = V.reshape(V_out.shape)
-        self._static_matvec(
-            self._static, V[self._Ns :], out=V_out[: self._Ns], a=+1, overwrite_out=True
-        )  # V_dot[:self._Ns] =  self._static.dot(V[self._Ns:])
-        self._static_matvec(
-            self._static, V[: self._Ns], out=V_out[self._Ns :], a=-1, overwrite_out=True
-        )  # V_dot[self._Ns:] = -self._static.dot(V[:self._Ns])
-        for func, Hd in iteritems(self._dynamic):
-            ft = func(time)
-            self._dynamic_matvec[func](
-                Hd, V[self._Ns :], out=V_out[: self._Ns], a=+ft, overwrite_out=False
-            )  # V_dot[:self._Ns] += func(time)*Hd.dot(V[self._Ns:])
-            self._dynamic_matvec[func](
-                Hd, V[: self._Ns], out=V_out[self._Ns :], a=-ft, overwrite_out=False
-            )  # V_dot[self._Ns:] += -func(time)*Hd.dot(V[:self._Ns])
-
-        return V_out
-
-    def __SO(self, time, V, V_out):
-        """
-        args:
-                V, the vector to multiple with
-                V_out, the vector to use with output.
-                time, the time to evalute drive at.
-
-        description:
-                This function is what gets passed into the ode solver. This is the Imaginary time Schrodinger operator -H(t)*|V >
-        """
-        V = V.reshape(V_out.shape)
-        self._static_matvec(self._static, V, out=V_out, overwrite_out=True)
-        for func, Hd in iteritems(self._dynamic):
-            self._dynamic_matvec[func](Hd,V,a=func(time),out=V_out,overwrite_out=False)
-            #V_out+=func(time)*Hd@V
-
-        V_out *= -1j
-        return V_out.ravel()
-
-    # def SO(self, time, V, V_out):
-    #     return self.__SO(time, V, V_out)
+    def __setstate__(self, state):
+        # Restore instance attributes.
+        self.__dict__.update(state)
+        # Restore the unpickleable entries.
+        self._get_matvecs()
 
     def evolve(
         self,
@@ -1576,7 +1543,6 @@ class hamiltonian(object):
         if _np.iscomplexobj(times):
             raise ValueError("times must be real number(s).")
 
-        evolve_args = (v0, t0, times)
         evolve_kwargs = solver_args
         evolve_kwargs["solver_name"] = solver_name
         evolve_kwargs["stack_state"] = stack_state
@@ -1597,11 +1563,11 @@ class hamiltonian(object):
                         "stack state is not compatible with imaginary time evolution."
                     )
 
-                evolve_args = evolve_args + (self.__ISO,)
                 result_dtype = _np.result_type(v0.dtype, self.dtype, _np.float64)
                 v0 = _np.array(v0, dtype=result_dtype, copy=True, order="C")
-                evolve_kwargs["f_params"] = (v0,)
+                evolve_kwargs["f_params"] = (v0, self)
                 evolve_kwargs["real"] = not _np.iscomplexobj(v0)
+                evolve_args = (v0, t0, times, _ISO)
 
             else:
                 evolve_kwargs["real"] = False
@@ -1613,17 +1579,15 @@ class hamiltonian(object):
                             "stack_state option cannot be used with complex-valued Hamiltonians"
                         )
                     shape = (v0.shape[0] * 2,) + v0.shape[1:]
-                    v0 = _np.zeros(shape, dtype=_np.float64, order="C")
-                    evolve_kwargs["f_params"] = (v0,)
-
-                    evolve_args = evolve_args + (self.__SO_real,)
+                    v0_real = _np.zeros(shape, dtype=_np.float64, order="C")
+                    evolve_kwargs["f_params"] = (v0_real, self)
+                    evolve_args = (v0, t0, times, _SO_real)
                 else:
                     v0 = _np.array(v0, dtype=_np.complex128, copy=True, order="C")
-                    evolve_kwargs["f_params"] = (v0,)
-                    evolve_args = evolve_args + (self.__SO,)
+                    evolve_kwargs["f_params"] = (v0, self)
+                    evolve_args = (v0, t0, times, _SO)
 
         elif eom == "LvNE":
-            n = 1.0
             if v0.ndim != 2:
                 raise ValueError("v0 must have ndim = 2")
 
@@ -1641,8 +1605,8 @@ class hamiltonian(object):
                     )
                 else:
                     v0 = _np.array(v0, dtype=_np.complex128, copy=True, order="C")
-                    evolve_kwargs["f_params"] = (v0,)
-                    evolve_args = evolve_args + (self.__LO,)
+                    evolve_kwargs["f_params"] = (v0, self)
+                    evolve_args = (v0, t0, times, _LO)
         else:
             raise ValueError(
                 "'{} equation' not recognized, must be 'SE' or 'LvNE'".format(eom)
